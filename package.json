@@ -5,7 +5,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\""
   },
-  "version": "2.0.0-beta.2",
+  "version": "2.0.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Cteq3132/homebridge-heatzy-pilote-as-thermostat.git"
