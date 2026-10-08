@@ -1,17 +1,25 @@
+<div class="alert alert-warning d-none" id="migration">
+  Your heaters are configured in the format of version 1, with your Heatzy password in the config.
+  Check them below and click <b>Save</b> to migrate them: your password will be removed from the config,
+  only a Heatzy token will be kept. They keep their rooms and automations in HomeKit.
+</div>
+
 <div class="card mb-3">
   <div class="card-body">
     <h5 class="card-title">Heatzy account</h5>
     <p class="card-text small text-muted">
       Used to list your devices and to get their local network passcode, saved in Homebridge storage.
       Once done, the plugin controls the devices on your local network, and only uses Heatzy servers as a fallback.
+      Your password is not saved: only a token given by Heatzy servers is kept in the config.
     </p>
+    <p class="small" id="token-status"></p>
     <div class="form-group">
       <label for="username">Email</label>
       <input type="email" class="form-control" id="username" autocomplete="username">
     </div>
     <div class="form-group">
       <label for="password">Password</label>
-      <input type="password" class="form-control" id="password" autocomplete="current-password">
+      <input type="password" class="form-control" id="password" autocomplete="current-password" placeholder="Not saved">
     </div>
     <button type="button" class="btn btn-primary" id="find">Find my devices</button>
   </div>
@@ -70,9 +78,37 @@
 </template>
 
 <script>
-  // One entry per did: the accessories already configured, merged with the devices found on the Heatzy account
+  const PLATFORM_NAME = "HeatzyPilote";
+  // Options of a heater, saved in the "devices" array of the platform
+  const DEVICE_KEYS = ["name", "did", "uuid_base", "interval", "fake_temp", "temp_unit", "local", "ip", "trace"];
+
+  // One entry per did: the heaters already configured, merged with the devices found on the Heatzy account
   const devices = new Map();
-  let configBlocks = [];
+  let platformBlock = null;
+  let legacyBlocks = [];
+  // Heatzy token: { token, expire_at } with expire_at in seconds
+  let auth = { token: null, expire_at: null };
+
+  function tokenValid() {
+    return !!auth.token && (!auth.expire_at || auth.expire_at * 1000 > Date.now());
+  }
+
+  function renderTokenStatus() {
+    const status = document.getElementById("token-status");
+    status.className = "small";
+    if (!auth.token) {
+      status.textContent = "Not signed in.";
+      status.classList.add("text-muted");
+    } else if (!tokenValid()) {
+      status.textContent = "The Heatzy token has expired: sign in again so that the plugin can use Heatzy servers.";
+      status.classList.add("text-danger");
+    } else {
+      status.textContent = "Signed in" + (auth.expire_at
+        ? ", the Heatzy token is valid until " + new Date(auth.expire_at * 1000).toLocaleString()
+        : "") + ".";
+      status.classList.add("text-success");
+    }
+  }
 
   function render() {
     const container = document.getElementById("devices");
@@ -136,16 +172,23 @@
     document.getElementById("save").classList.toggle("d-none", devices.size === 0);
   }
 
-  async function findDevices() {
+  // Signs in when a password has been typed. The password is then forgotten: only the token is kept
+  async function signIn() {
     const username = document.getElementById("username").value.trim();
-    const password = document.getElementById("password").value;
-    if (!username || !password) {
-      homebridge.toast.error("Enter your Heatzy email and password");
-      return;
-    }
+    const passwordInput = document.getElementById("password");
+    if (!passwordInput.value) return;
+    if (!username) throw new Error("Enter your Heatzy email");
+    auth = await homebridge.request("/login", { username, password: passwordInput.value });
+    passwordInput.value = "";
+    renderTokenStatus();
+  }
+
+  async function findDevices() {
     homebridge.showSpinner();
     try {
-      const found = await homebridge.request("/devices", { username, password });
+      await signIn();
+      if (!tokenValid()) throw new Error("Enter your Heatzy email and password");
+      const found = await homebridge.request("/devices", { token: auth.token });
       for (const device of devices.values()) {
         if (device.read) device.draft = device.read();
       }
@@ -164,9 +207,7 @@
   }
 
   async function save() {
-    const username = document.getElementById("username").value.trim();
-    const password = document.getElementById("password").value;
-    const blocks = [];
+    const list = [];
     for (const device of devices.values()) {
       const values = device.read();
       if (!values.enabled) continue;
@@ -174,11 +215,12 @@
         homebridge.toast.error("Each device needs a name");
         return;
       }
-      const block = Object.assign({}, device.block, {
-        accessory: "HeatzyPilote",
+      const block = {};
+      for (const key of DEVICE_KEYS) {
+        if (device.block && device.block[key] !== undefined) block[key] = device.block[key];
+      }
+      Object.assign(block, {
         name: values.name,
-        username: username || (device.block && device.block.username),
-        password: password || (device.block && device.block.password),
         did: device.did,
         temp_unit: values.temp_unit,
         local: values.local,
@@ -188,25 +230,77 @@
         if (values[key] === undefined) delete block[key];
         else block[key] = values[key];
       }
-      blocks.push(block);
+      list.push(block);
     }
-    // Blocks without a did cannot be shown here: keep them as they are
-    blocks.push(...configBlocks.filter((block) => !block.did));
-    await homebridge.updatePluginConfig(blocks);
-    await homebridge.savePluginConfig();
-    homebridge.toast.success("Saved. Restart Homebridge to apply the changes");
+
+    homebridge.showSpinner();
+    try {
+      await signIn();
+      if (!auth.token) throw new Error("Sign in to your Heatzy account first");
+
+      const block = Object.assign({ name: "Heatzy" }, platformBlock, {
+        platform: PLATFORM_NAME,
+        username: document.getElementById("username").value.trim() || undefined,
+        token: auth.token,
+        token_expire_at: auth.expire_at || undefined,
+        devices: list,
+      });
+      delete block.password;
+      // Heaters of version 1 that were all in the same child bridge stay in it
+      const bridges = legacyBlocks.map((legacy) => legacy._bridge && legacy._bridge.username);
+      if (!platformBlock && bridges.length > 0 && bridges[0] && bridges.every((b) => b === bridges[0])) {
+        block._bridge = legacyBlocks[0]._bridge;
+      }
+
+      await homebridge.updatePluginConfig([block]);
+      await homebridge.savePluginConfig();
+      platformBlock = block;
+      if (legacyBlocks.length > 0) {
+        await homebridge.request("/legacy/remove");
+        legacyBlocks = [];
+        document.getElementById("migration").classList.add("d-none");
+      }
+      homebridge.toast.success("Saved. Restart Homebridge to apply the changes");
+    } catch (error) {
+      homebridge.toast.error(error.message, "Heatzy");
+    } finally {
+      homebridge.hideSpinner();
+    }
   }
 
   homebridge.addEventListener("ready", async () => {
-    configBlocks = await homebridge.getPluginConfig();
-    for (const block of configBlocks) {
-      if (block.did) devices.set(block.did, { did: block.did, block, enabled: true });
+    platformBlock = (await homebridge.getPluginConfig())[0] || null;
+    try {
+      legacyBlocks = await homebridge.request("/legacy");
+    } catch (error) {
+      homebridge.toast.error(error.message, "Heatzy");
     }
-    const first = configBlocks.find((block) => block.username) || {};
-    document.getElementById("username").value = first.username || "";
-    document.getElementById("password").value = first.password || "";
+
+    const blocks = ((platformBlock && platformBlock.devices) || []).concat(legacyBlocks);
+    for (const block of blocks) {
+      if (block.did && !devices.has(block.did)) devices.set(block.did, { did: block.did, block, enabled: true });
+    }
+    if (platformBlock && platformBlock.token) {
+      auth = { token: platformBlock.token, expire_at: platformBlock.token_expire_at || null };
+    }
+
+    const legacyWithPassword = legacyBlocks.find((block) => block.username && block.password);
+    document.getElementById("username").value =
+      (platformBlock && platformBlock.username) || (legacyWithPassword && legacyWithPassword.username) || "";
+    if (legacyBlocks.length > 0) {
+      document.getElementById("migration").classList.remove("d-none");
+      // Used once, to get a token when saving
+      if (!auth.token && legacyWithPassword) {
+        document.getElementById("password").value = legacyWithPassword.password;
+      }
+      if (new Set(legacyBlocks.map((block) => block.username)).size > 1) {
+        homebridge.toast.warning("Your heaters use several Heatzy accounts: only the account you sign in with will be used");
+      }
+    }
+
     document.getElementById("find").addEventListener("click", findDevices);
     document.getElementById("save").addEventListener("click", save);
+    renderTokenStatus();
     render();
   });
 </script>

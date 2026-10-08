@@ -1,14 +1,17 @@
 name: Publish to npm
 
 # Publishes the package when the version in package.json is not on npm yet:
-# bump "version" in package.json, merge into master, and the release is published.
+# bump "version" in package.json, merge into master, and the release is published,
+# with a GitHub release whose notes list the pull requests merged since the previous one.
+# A prerelease version (2.0.0-beta.1) is published with the "beta" tag: run this workflow
+# manually on its branch, Homebridge UI offers it in "Install alternate version".
 on:
   push:
     branches: [master]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write # GitHub release
   id-token: write # npm trusted publishing (OIDC), no npm token needed
 
 jobs:
@@ -37,6 +40,20 @@ jobs:
             echo "Publishing $NAME@$VERSION"
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
+          if [[ "$VERSION" == *-* ]]; then
+            echo "tag=beta" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
 
       - if: steps.check.outputs.publish == 'true'
-        run: npm publish
+        run: npm publish --tag ${{ steps.check.outputs.tag }}
+
+      - name: Create the GitHub release
+        if: steps.check.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          PRERELEASE=$([ "${{ steps.check.outputs.tag }}" = beta ] && echo --prerelease || true)
+          gh release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes $PRERELEASE
