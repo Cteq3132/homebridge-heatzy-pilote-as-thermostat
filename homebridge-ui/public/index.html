@@ -1,0 +1,212 @@
+<div class="card mb-3">
+  <div class="card-body">
+    <h5 class="card-title">Heatzy account</h5>
+    <p class="card-text small text-muted">
+      Used to list your devices and to get their local network passcode, saved in Homebridge storage.
+      Once done, the plugin controls the devices on your local network, and only uses Heatzy servers as a fallback.
+    </p>
+    <div class="form-group">
+      <label for="username">Email</label>
+      <input type="email" class="form-control" id="username" autocomplete="username">
+    </div>
+    <div class="form-group">
+      <label for="password">Password</label>
+      <input type="password" class="form-control" id="password" autocomplete="current-password">
+    </div>
+    <button type="button" class="btn btn-primary" id="find">Find my devices</button>
+  </div>
+</div>
+
+<div id="devices"></div>
+
+<button type="button" class="btn btn-primary d-none" id="save">Save</button>
+
+<template id="device-template">
+  <div class="card mb-3">
+    <div class="card-body">
+      <div class="custom-control custom-checkbox mb-2">
+        <input type="checkbox" class="custom-control-input" data-field="enabled">
+        <label class="custom-control-label font-weight-bold" data-field="title"></label>
+      </div>
+      <p class="small text-muted mb-2" data-field="info"></p>
+      <div class="form-group">
+        <label>Name in HomeKit</label>
+        <input type="text" class="form-control" data-field="name">
+      </div>
+      <details>
+        <summary class="mb-2">Options</summary>
+        <div class="form-row">
+          <div class="form-group col-sm-4">
+            <label>Refresh interval (s)</label>
+            <input type="number" min="5" class="form-control" data-field="interval" placeholder="60">
+          </div>
+          <div class="form-group col-sm-4">
+            <label>Fake temperature</label>
+            <input type="number" min="10" max="38" class="form-control" data-field="fake_temp" placeholder="20">
+          </div>
+          <div class="form-group col-sm-4">
+            <label>Temperature unit</label>
+            <select class="form-control" data-field="temp_unit">
+              <option value="C">°C</option>
+              <option value="F">°F</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Device IP (optional, found automatically)</label>
+          <input type="text" class="form-control" data-field="ip" placeholder="192.168.1.20">
+        </div>
+        <div class="custom-control custom-checkbox">
+          <input type="checkbox" class="custom-control-input" data-field="local">
+          <label class="custom-control-label">Local network control</label>
+        </div>
+        <div class="custom-control custom-checkbox">
+          <input type="checkbox" class="custom-control-input" data-field="trace">
+          <label class="custom-control-label">Trace in Homebridge log</label>
+        </div>
+      </details>
+    </div>
+  </div>
+</template>
+
+<script>
+  // One entry per did: the accessories already configured, merged with the devices found on the Heatzy account
+  const devices = new Map();
+  let configBlocks = [];
+
+  function render() {
+    const container = document.getElementById("devices");
+    container.innerHTML = "";
+    const template = document.getElementById("device-template");
+    let index = 0;
+    for (const device of devices.values()) {
+      const card = template.content.cloneNode(true);
+      const field = (name) => card.querySelector('[data-field="' + name + '"]');
+      const block = device.block || {};
+      // Checkbox labels need a unique id
+      card.querySelectorAll(".custom-control").forEach((control, i) => {
+        const id = "device-" + index + "-" + i;
+        control.querySelector("input").id = id;
+        control.querySelector("label").htmlFor = id;
+      });
+      field("title").textContent = device.alias || block.name || device.did;
+      const info = ["did " + device.did];
+      if (device.product) info.push(device.product);
+      if (device.found) info.push(device.online ? "online" : "offline");
+      if (device.found) info.push(device.local ? "local control available" : "Heatzy servers only");
+      if (!device.found && device.block) info.push("already configured");
+      field("info").textContent = info.join(" · ");
+      // Values typed before a new search are kept
+      const values = device.draft || {
+        enabled: device.enabled,
+        name: block.name || device.alias || "",
+        interval: block.interval,
+        fake_temp: block.fake_temp,
+        temp_unit: block.temp_unit,
+        ip: block.ip,
+        local: block.local !== false,
+        trace: !!block.trace,
+      };
+      field("enabled").checked = values.enabled;
+      field("name").value = values.name;
+      field("interval").value = values.interval || "";
+      field("fake_temp").value = values.fake_temp || "";
+      field("temp_unit").value = values.temp_unit === "F" ? "F" : "C";
+      field("ip").value = values.ip || "";
+      field("local").checked = values.local;
+      field("trace").checked = values.trace;
+
+      // The elements keep working after the fragment is appended to the page
+      const enabled = field("enabled"), name = field("name"), interval = field("interval"), fakeTemp = field("fake_temp"),
+        tempUnit = field("temp_unit"), ip = field("ip"), local = field("local"), trace = field("trace");
+      enabled.addEventListener("change", () => { device.enabled = enabled.checked; });
+      device.read = () => ({
+        enabled: enabled.checked,
+        name: name.value.trim(),
+        interval: parseInt(interval.value, 10) || undefined,
+        fake_temp: parseInt(fakeTemp.value, 10) || undefined,
+        temp_unit: tempUnit.value,
+        ip: ip.value.trim() || undefined,
+        local: local.checked,
+        trace: trace.checked,
+      });
+      container.appendChild(card);
+      index++;
+    }
+    document.getElementById("save").classList.toggle("d-none", devices.size === 0);
+  }
+
+  async function findDevices() {
+    const username = document.getElementById("username").value.trim();
+    const password = document.getElementById("password").value;
+    if (!username || !password) {
+      homebridge.toast.error("Enter your Heatzy email and password");
+      return;
+    }
+    homebridge.showSpinner();
+    try {
+      const found = await homebridge.request("/devices", { username, password });
+      for (const device of devices.values()) {
+        if (device.read) device.draft = device.read();
+      }
+      for (const d of found) {
+        const device = devices.get(d.did) || { did: d.did, enabled: true };
+        Object.assign(device, d, { found: true });
+        devices.set(d.did, device);
+      }
+      render();
+      homebridge.toast.success(found.length + " device(s) found, passcodes saved");
+    } catch (error) {
+      homebridge.toast.error(error.message, "Heatzy");
+    } finally {
+      homebridge.hideSpinner();
+    }
+  }
+
+  async function save() {
+    const username = document.getElementById("username").value.trim();
+    const password = document.getElementById("password").value;
+    const blocks = [];
+    for (const device of devices.values()) {
+      const values = device.read();
+      if (!values.enabled) continue;
+      if (!values.name) {
+        homebridge.toast.error("Each device needs a name");
+        return;
+      }
+      const block = Object.assign({}, device.block, {
+        accessory: "HeatzyPilote",
+        name: values.name,
+        username: username || (device.block && device.block.username),
+        password: password || (device.block && device.block.password),
+        did: device.did,
+        temp_unit: values.temp_unit,
+        local: values.local,
+        trace: values.trace,
+      });
+      for (const key of ["interval", "fake_temp", "ip"]) {
+        if (values[key] === undefined) delete block[key];
+        else block[key] = values[key];
+      }
+      blocks.push(block);
+    }
+    // Blocks without a did cannot be shown here: keep them as they are
+    blocks.push(...configBlocks.filter((block) => !block.did));
+    await homebridge.updatePluginConfig(blocks);
+    await homebridge.savePluginConfig();
+    homebridge.toast.success("Saved. Restart Homebridge to apply the changes");
+  }
+
+  homebridge.addEventListener("ready", async () => {
+    configBlocks = await homebridge.getPluginConfig();
+    for (const block of configBlocks) {
+      if (block.did) devices.set(block.did, { did: block.did, block, enabled: true });
+    }
+    const first = configBlocks.find((block) => block.username) || {};
+    document.getElementById("username").value = first.username || "";
+    document.getElementById("password").value = first.password || "";
+    document.getElementById("find").addEventListener("click", findDevices);
+    document.getElementById("save").addEventListener("click", save);
+    render();
+  });
+</script>

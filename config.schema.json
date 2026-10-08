@@ -1,0 +1,22 @@
+{
+  "pluginAlias": "HeatzyPilote",
+  "pluginType": "accessory",
+  "singular": false,
+  "customUi": true,
+  "headerDisplay": "Sign in with your Heatzy account to add your devices. The local network passcode of each device is saved in Homebridge storage, so that the plugin can work without Heatzy servers.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": { "title": "Name", "type": "string", "required": true },
+      "username": { "title": "Heatzy email", "type": "string", "required": true },
+      "password": { "title": "Heatzy password", "type": "string", "required": true },
+      "did": { "title": "Device ID (did)", "type": "string", "required": true },
+      "interval": { "title": "Refresh interval (s)", "type": "integer", "default": 60, "minimum": 5 },
+      "fake_temp": { "title": "Fake temperature", "type": "integer", "default": 20, "minimum": 10, "maximum": 38 },
+      "temp_unit": { "title": "Temperature unit", "type": "string", "default": "C", "oneOf": [{ "title": "°C", "enum": ["C"] }, { "title": "°F", "enum": ["F"] }] },
+      "local": { "title": "Local network control (falls back to Heatzy servers)", "type": "boolean", "default": true },
+      "ip": { "title": "Device IP (optional, found automatically)", "type": "string", "format": "ipv4" },
+      "trace": { "title": "Trace", "type": "boolean", "default": false }
+    }
+  }
+}

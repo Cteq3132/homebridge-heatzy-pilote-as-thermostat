@@ -1,7 +1,10 @@
 "use strict";
 
 const url = require("url");
+const fs = require("fs");
+const path = require("path");
 const axios = require("axios");
+const lan = require("./lan");
 
 // From Heatzy API : https://drive.google.com/drive/folders/0B9nVzuTl4YMOaXAzRnRhdXVma1k
 // https://heatzy.com/blog/tout-sur-heatzy
@@ -10,13 +13,17 @@ const loginUrl = url.parse(heatzyUrl + "login");
 const heatzy_Application_Id = "c70a66ff039d41b4a220e198b0fcc8b3";
 const requestTimeout = 10000; // ms, without it a request to Heatzy servers can hang forever
 const confirmDelay = 10000; // ms, time for Heatzy servers to reflect a change made from HomeKit
+const localConfirmDelay = 1000; // ms, a change made on the local network is reflected at once
+const localInfoRetryDelay = 10 * 60 * 1000; // ms, between two attempts to get the passcode from Heatzy servers
+const discoveryRetryDelay = 5 * 60 * 1000; // ms, between two searches of the device on the local network
 
-let Service, Characteristic;
+let Service, Characteristic, storagePath;
 
 module.exports = (homebridge) => {
   /* this is the starting point for the plugin where we register the accessory */
   Service = homebridge.hap.Service;
   Characteristic = homebridge.hap.Characteristic;
+  storagePath = path.join(homebridge.user.storagePath(), "heatzy-pilote");
   homebridge.registerAccessory(
     "homebridge-heatzy-as-Thermostat",
     "HeatzyPilote",
@@ -38,6 +45,18 @@ function ThermostatAccessory(log, config) {
   this.fake_temp = config["fake_temp"] >= 10 && config["fake_temp"] <= 38 ? config["fake_temp"] : 20;
   this.temp_unit = config["temp_unit"] === "F" ? 1 : 0;
   this.trace = config["trace"] || false;
+  this.did = config["did"];
+  this.local = config["local"] !== false;
+  this.configIp = config["ip"] || null;
+
+  // Local mode: passcode, IP and datapoint schema are kept in Homebridge storage,
+  // so that Heatzy servers are only needed once
+  this.localState = this.local ? loadLocalState(this) : {};
+  this.localInfoRetryAt = 0;
+  this.discoveryRetryAt = 0;
+  this.localQueue = Promise.resolve();
+  this.localWorking = null;
+  this.lastWriteLocal = false;
 
   // Heatzy token
   this.heatzyToken = "";
@@ -146,8 +165,196 @@ function modeToState(device, mode) {
   }
 }
 
+function stateFromAttrs(device, mode, timer_switch) {
+  const current = modeToState(device, mode);
+  const target = timer_switch == 1
+    ? Characteristic.TargetHeatingCoolingState.AUTO
+    : current;
+  return { current, target };
+}
+
+function localStateFile(device) {
+  return path.join(storagePath, device.did + ".json");
+}
+
+function loadLocalState(device) {
+  try {
+    return JSON.parse(fs.readFileSync(localStateFile(device), "utf8"));
+  } catch (error) {
+    return {};
+  }
+}
+
+function saveLocalState(device) {
+  try {
+    fs.mkdirSync(storagePath, { recursive: true });
+    // The passcode gives control of the device on the local network
+    fs.writeFileSync(localStateFile(device), JSON.stringify(device.localState), { mode: 0o600 });
+  } catch (error) {
+    device.log("Error - Cannot save local mode state: " + describeError(error));
+  }
+}
+
+async function cloudGet(device, endpoint) {
+  await ensureToken(device);
+  const response = await axios.get(heatzyUrl + endpoint, {
+    timeout: requestTimeout,
+    headers: {
+      "X-Gizwits-Application-Id": heatzy_Application_Id,
+      "X-Gizwits-User-token": device.heatzyToken,
+    },
+  });
+  return response.data;
+}
+
+// Gets the passcode and the datapoint schema from Heatzy servers, if they are not known yet.
+// Returns true when the device can be controlled locally
+async function ensureLocalInfo(device) {
+  const state = device.localState;
+  if (state.unsupported) return false;
+  if (state.passcode && state.schema) return true;
+  if (Date.now() < device.localInfoRetryAt) return false;
+  device.localInfoRetryAt = Date.now() + localInfoRetryDelay;
+
+  try {
+    let binding = null;
+    for (let skip = 0; !binding; skip += 20) {
+      const devices = (await cloudGet(device, "bindings?limit=20&skip=" + skip)).devices || [];
+      binding = devices.find((d) => d.did === device.did);
+      if (devices.length < 20) break;
+    }
+    if (!binding || !binding.passcode) {
+      device.log("Error - Local mode: no passcode for this device on Heatzy servers");
+      return false;
+    }
+    const schema = lan.compactSchema(await cloudGet(device, "datapoint?product_key=" + binding.product_key));
+    if (!schema) {
+      device.log("Local mode is not supported by this device (" + binding.product_name + "), using Heatzy servers");
+      device.localState = { unsupported: true };
+      saveLocalState(device);
+      return false;
+    }
+    device.localState = Object.assign({}, state, {
+      passcode: binding.passcode,
+      mac: binding.mac,
+      ip: binding.lan_ip || state.ip || null,
+      schema,
+    });
+    saveLocalState(device);
+    if (device.trace) {
+      device.log("Local mode: passcode and schema saved for " + binding.product_name);
+    }
+    return true;
+  } catch (error) {
+    device.log("Error - Local mode: cannot get the passcode from Heatzy servers: " + describeError(error));
+    return false;
+  }
+}
+
+async function findLocalIp(device, force) {
+  if (device.configIp) return device.configIp;
+  if (device.localState.ip && !force) return device.localState.ip;
+  if (Date.now() < device.discoveryRetryAt) return null;
+
+  const ip = await lan.discover(device.did, [device.localState.ip]);
+  if (!ip) {
+    device.discoveryRetryAt = Date.now() + discoveryRetryDelay;
+    return null;
+  }
+  if (ip !== device.localState.ip) {
+    device.log("Local mode: device found at " + ip);
+    device.localState.ip = ip;
+    saveLocalState(device);
+  }
+  return ip;
+}
+
+// Runs fn(session) in an authenticated LAN session. Sessions of a device never overlap.
+// Returns the result of fn, or throws
+function withLocalSession(device, fn) {
+  const run = async () => {
+    if (!(await ensureLocalInfo(device))) throw new Error("local mode unavailable");
+
+    let ip = await findLocalIp(device, false);
+    for (let attempt = 0; ; attempt++) {
+      if (!ip) throw new Error("device not found on the local network");
+      const session = new lan.Session(ip, device.did);
+      try {
+        await session.open(device.localState.passcode);
+        return await fn(session);
+      } catch (error) {
+        if (error.code === "PASSCODE") {
+          // The device has been reset or bound again: get the new passcode
+          device.localState.passcode = null;
+          device.localInfoRetryAt = 0;
+          saveLocalState(device);
+          throw error;
+        }
+        const connectionError = ["ECONNREFUSED", "ETIMEDOUT", "EHOSTUNREACH", "EHOSTDOWN", "ENETUNREACH"].includes(error.code) ||
+          /timeout/i.test(error.message);
+        if (attempt > 0 || !connectionError) throw error;
+        // The IP may have changed (DHCP): search the device again
+        if (!device.configIp) {
+          ip = (await findLocalIp(device, true)) || ip;
+        }
+        // The device drops logins that arrive at the same time (e.g. from the Heatzy app): retry once, a bit later
+        await new Promise((resolve) => setTimeout(resolve, 300 + Math.random() * 700));
+      } finally {
+        session.close();
+      }
+    }
+  };
+  const result = device.localQueue.then(run);
+  device.localQueue = result.catch(() => {});
+  return result;
+}
+
+// Logs only the changes between local and cloud, not every failed attempt
+function setLocalWorking(device, working, error) {
+  if (working === device.localWorking) return;
+  if (working) {
+    device.log("Local mode: connected to the device on the local network");
+  } else if (device.localState.passcode || device.trace) {
+    device.log("Local mode unavailable (" + describeError(error) + "), using Heatzy servers");
+  }
+  device.localWorking = working;
+}
+
+async function getLocalDeviceState(device) {
+  return withLocalSession(device, async (session) => {
+    const status = await session.read();
+    const attrs = device.localState.schema.attrs;
+    return stateFromAttrs(device, lan.decodeAttr(status, attrs.mode), lan.decodeAttr(status, attrs.timer_switch));
+  });
+}
+
+async function setLocalTargetState(device, state) {
+  const attrs = { timer_switch: state === 3 ? 1 : 0 };
+  if (state !== 3) {
+    attrs.mode = (state === 0) ? "stop" : (state === 1 ? "cft" : "eco");
+  }
+  await withLocalSession(device, async (session) => {
+    const status = await session.read();
+    await session.write(device.localState.schema, status, attrs);
+  });
+  return state;
+}
+
 // Returns { current, target }, or null if the state could not be read
 async function getDeviceState(device) {
+  if (device.local) {
+    try {
+      const state = await getLocalDeviceState(device);
+      setLocalWorking(device, true);
+      return state;
+    } catch (error) {
+      setLocalWorking(device, false, error);
+    }
+  }
+  return getCloudDeviceState(device);
+}
+
+async function getCloudDeviceState(device) {
   await ensureToken(device);
 
   try {
@@ -164,11 +371,7 @@ async function getDeviceState(device) {
       );
       return null;
     }
-    const current = modeToState(device, response.data.attr.mode);
-    const target = response.data.attr.timer_switch == 1
-      ? Characteristic.TargetHeatingCoolingState.AUTO
-      : current;
-    return { current, target };
+    return stateFromAttrs(device, response.data.attr.mode, response.data.attr.timer_switch);
   } catch (error) {
     if (error && error.response && error.response.status == 400) {
       // Token probably revoked: force a new login on next request
@@ -180,6 +383,21 @@ async function getDeviceState(device) {
 }
 
 async function setTargetState(device, state) {
+  device.lastWriteLocal = false;
+  if (device.local) {
+    try {
+      state = await setLocalTargetState(device, state);
+      setLocalWorking(device, true);
+      device.lastWriteLocal = true;
+      return state;
+    } catch (error) {
+      setLocalWorking(device, false, error);
+    }
+  }
+  return setCloudTargetState(device, state);
+}
+
+async function setCloudTargetState(device, state) {
   state = await setTargetProgState(device, state);
   if (state !== 3 && state !== null) {
     state = await setTargetMode(device, state);
@@ -335,13 +553,14 @@ ThermostatAccessory.prototype.handleTargetHeatingCoolingStateSet = async functio
   }
 
   callback(null);
-  this.ignoreUpdatesUntil = Date.now() + confirmDelay;
+  const delay = this.lastWriteLocal ? localConfirmDelay : confirmDelay;
+  this.ignoreUpdatesUntil = Date.now() + delay;
   this.target_state = state;
   if (state !== Characteristic.TargetHeatingCoolingState.AUTO) {
     this.applyState(state, state);
   }
-  // Read the real state once Heatzy servers have taken the change into account
-  this.confirmTimer = setTimeout(this.refreshState.bind(this), confirmDelay + 100);
+  // Read the real state once the device (or Heatzy servers) has taken the change into account
+  this.confirmTimer = setTimeout(this.refreshState.bind(this), delay + 100);
 };
 
 ThermostatAccessory.prototype.handleCurrentTemperatureGet = function (
