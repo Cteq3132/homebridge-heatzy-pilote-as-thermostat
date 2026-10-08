@@ -8,6 +8,8 @@ const axios = require("axios");
 const heatzyUrl = "https://euapi.gizwits.com/app/";
 const loginUrl = url.parse(heatzyUrl + "login");
 const heatzy_Application_Id = "c70a66ff039d41b4a220e198b0fcc8b3";
+const requestTimeout = 10000; // ms, without it a request to Heatzy servers can hang forever
+const confirmDelay = 10000; // ms, time for Heatzy servers to reflect a change made from HomeKit
 
 let Service, Characteristic;
 
@@ -43,6 +45,10 @@ function ThermostatAccessory(log, config) {
 
   this.current_state = null;
   this.target_state = null;
+  this.reachable = false;
+  this.refreshing = null;
+  this.ignoreUpdatesUntil = 0;
+  this.confirmTimer = null;
 
   this.informationService = new Service.AccessoryInformation()
     .setCharacteristic(Characteristic.Manufacturer, "Heatzy")
@@ -83,6 +89,7 @@ async function updateToken(device) {
     const response = await axios({
       method: "post",
       url: loginUrl,
+      timeout: requestTimeout,
       headers: {
         "X-Gizwits-Application-Id": heatzy_Application_Id,
       },
@@ -101,103 +108,74 @@ async function updateToken(device) {
       );
     }
   } catch (error) {
-    device.log(
-      "Error : " + error.response.status + " " + error.response.statusText
-    );
-    device.log(
-      "Error - Plugin unable to login to Heatzy server, and will not work"
-    );
+    // Never throw from here: an exception would become an unhandled rejection and crash Homebridge
+    device.log("Error : " + describeError(error));
+    device.log("Error - Plugin unable to login to Heatzy server");
   }
 }
 
-async function getCurrentState(device) {
+async function ensureToken(device) {
   if (device.heatzyTokenExpire_at < Date.now()) {
     await updateToken(device);
   }
+}
 
-  let state = 0;
+// Network errors (timeout, DNS, connection reset...) have no response
+function describeError(error) {
+  if (error && error.response) {
+    return error.response.status + " " + error.response.statusText;
+  }
+  return error && error.message ? error.message : String(error);
+}
+
+// CurrentHeatingCoolingState and TargetHeatingCoolingState share the values OFF (0), HEAT (1) and COOL (2)
+function modeToState(device, mode) {
+  switch (mode) {
+    case "cft":
+      return Characteristic.CurrentHeatingCoolingState.HEAT;
+    case "eco":
+      return Characteristic.CurrentHeatingCoolingState.COOL;
+    case "stop":
+    case "fro":
+      return Characteristic.CurrentHeatingCoolingState.OFF;
+    default:
+      if (device.trace) {
+        device.log("Unknown mode " + mode + ", displayed as Off");
+      }
+      return Characteristic.CurrentHeatingCoolingState.OFF;
+  }
+}
+
+// Returns { current, target }, or null if the state could not be read
+async function getDeviceState(device) {
+  await ensureToken(device);
+
   try {
     const response = await axios.get(device.getUrl, {
+      timeout: requestTimeout,
       headers: {
         "X-Gizwits-Application-Id": heatzy_Application_Id,
         "X-Gizwits-User-token": device.heatzyToken,
       },
     });
-    if (response.status == 200) {
-      switch (response.data.attr.mode) {
-        case "cft":
-          state = Characteristic.CurrentHeatingCoolingState.HEAT;
-          break;
-        case "eco":
-          state = Characteristic.CurrentHeatingCoolingState.COOL;
-          break;
-        case "stop":
-        case "fro":
-        default:
-          state = Characteristic.CurrentHeatingCoolingState.OFF;
-          break;
-      }
-    } else {
+    if (response.status != 200) {
       device.log(
         `${response.status} ${response.statusText} ${response.data.error_message}`
       );
-      state = null;
+      return null;
     }
+    const current = modeToState(device, response.data.attr.mode);
+    const target = response.data.attr.timer_switch == 1
+      ? Characteristic.TargetHeatingCoolingState.AUTO
+      : current;
+    return { current, target };
   } catch (error) {
-    device.log(
-      "Error : " + error.response.status + " " + error.response.statusText
-    );
-    state = null;
-  } finally {
-    return state;
-  }
-}
-
-async function getTargetState(device) {
-  if (device.heatzyTokenExpire_at < Date.now()) {
-    await updateToken(device);
-  }
-
-  let state = false;
-  try {
-    const response = await axios.get(device.getUrl, {
-      headers: {
-        "X-Gizwits-Application-Id": heatzy_Application_Id,
-        "X-Gizwits-User-token": device.heatzyToken,
-      },
-    });
-    if (response.status == 200) {
-      if (response.data.attr.timer_switch == 1) {
-        state = Characteristic.TargetHeatingCoolingState.AUTO;
-      }
-      else {
-        switch (response.data.attr.mode) {
-          case "cft":
-            state = Characteristic.TargetHeatingCoolingState.HEAT;
-            break;
-          case "eco":
-            state = Characteristic.TargetHeatingCoolingState.COOL;
-            break;
-          case "stop":
-          case "fro":
-          default:
-            state = Characteristic.TargetHeatingCoolingState.OFF;
-            break;
-        }
-      }
-    } else {
-      device.log(
-        `${response.status} ${response.statusText} ${response.data.error_message}`
-      );
-      state = null;
+    if (error && error.response && error.response.status == 400) {
+      // Token probably revoked: force a new login on next request
+      device.heatzyTokenExpire_at = Date.now() - 10000;
     }
-  } catch (error) {
-    device.log(
-      "Error : " + error.response.status + " " + error.response.statusText
-    );
-    state = null;
-  } finally {
-    return state;
+    device.log("Error : " + describeError(error));
+    return null;
   }
 }
 
@@ -209,26 +187,22 @@ async function setTargetState(device, state) {
   return state;
 }
 
-async function setTargetMode(device, state) {
-  if (device.heatzyTokenExpire_at < Date.now()) {
-    await updateToken(device);
-  }
+async function sendCommand(device, attrs) {
+  await ensureToken(device);
 
   try {
-    const request = {
+    const response = await axios({
       method: "post",
       url: device.postUrl,
+      timeout: requestTimeout,
       headers: {
         "X-Gizwits-Application-Id": heatzy_Application_Id,
         "X-Gizwits-User-token": device.heatzyToken,
       },
       data: {
-        attrs: {
-          mode: (state === 0) ? "stop" : (state === 1 ? "cft" : "eco"),
-        },
+        attrs: attrs,
       },
-    }
-    const response = await axios(request);
+    });
     if (response.status != 200) {
       device.log(
         "Error - returned code not 200: " +
@@ -238,118 +212,108 @@ async function setTargetMode(device, state) {
         " " +
         response.data.error_message
       );
-      state = null;
+      return false;
     }
+    return true;
   } catch (error) {
-    device.log(
-      "Error : " + error.response.status + " " + error.response.statusText
-    );
-    state = null;
-  } finally {
-    return state;
+    device.log("Error : " + describeError(error));
+    return false;
   }
+}
+
+async function setTargetMode(device, state) {
+  const mode = (state === 0) ? "stop" : (state === 1 ? "cft" : "eco");
+  return (await sendCommand(device, { mode: mode })) ? state : null;
 }
 
 async function setTargetProgState(device, state) {
-  if (device.heatzyTokenExpire_at < Date.now()) {
-    await updateToken(device);
-  }
-
-  try {
-    const request = {
-      method: "post",
-      url: device.postUrl,
-      headers: {
-        "X-Gizwits-Application-Id": heatzy_Application_Id,
-        "X-Gizwits-User-token": device.heatzyToken,
-      },
-      data: {
-        attrs: {
-          timer_switch: state === 3 ? 1 : 0
-        },
-      },
-    }
-    const response = await axios(request);
-    if (response.status != 200) {
-      device.log(
-        "Error - returned code not 200: " +
-        response.status +
-        " " +
-        response.statusText +
-        " " +
-        response.data.error_message
-      );
-      state = null;
-    }
-  } catch (error) {
-    device.log(
-      "Error : " + error.response.status + " " + error.response.statusText
-    );
-    state = null;
-  } finally {
-    return state;
-  }
+  const timer_switch = state === 3 ? 1 : 0;
+  return (await sendCommand(device, { timer_switch: timer_switch })) ? state : null;
 }
 
-ThermostatAccessory.prototype.updateState = async function () {
-  const current_state = await getCurrentState(this);
-  if (current_state !== null) {
-    if (this.current_state === null) {
-      this.current_state = current_state;
-    }
-    if (current_state !== this.current_state) {
-      if (this.current_state) {
-        this.log("State has changed from: " + this.current_state + " to " + current_state);
+// Reads the state from Heatzy and notifies HomeKit of any change.
+// Concurrent calls share the same request. Never rejects.
+ThermostatAccessory.prototype.refreshState = function () {
+  if (!this.refreshing) {
+    this.refreshing = (async () => {
+      try {
+        const state = await getDeviceState(this);
+        this.reachable = state !== null;
+        // Heatzy servers may still return the previous state just after a change made from HomeKit
+        if (state !== null && Date.now() >= this.ignoreUpdatesUntil) {
+          this.applyState(state.current, state.target);
+        }
+      } catch (error) {
+        this.reachable = false;
+        this.log("Error : " + describeError(error));
+      } finally {
+        this.refreshing = null;
       }
-      this.current_state = current_state;
-      this.service.updateCharacteristic(Characteristic.CurrentHeatingCoolingState, current_state);
+    })();
+  }
+  return this.refreshing;
+};
 
+ThermostatAccessory.prototype.applyState = function (current_state, target_state) {
+  if (current_state !== this.current_state) {
+    if (this.current_state !== null) {
+      this.log("Current state has changed from: " + this.current_state + " to " + current_state);
     }
+    this.current_state = current_state;
+    this.service.updateCharacteristic(Characteristic.CurrentHeatingCoolingState, current_state);
   }
 
-  const target_state = await getTargetState(this);
-  if (target_state !== null) {
-    if (this.target_state === null) {
-      this.target_state = target_state;
+  if (target_state !== this.target_state) {
+    if (this.target_state !== null) {
+      this.log("Target state has changed from: " + this.target_state + " to " + target_state);
     }
-    if (target_state !== this.target_state) {
-      if (this.target_state) {
-        this.log("State has changed from: " + this.target_state + " to " + target_state);
-      }
-      this.target_state = target_state;
-      this.service.updateCharacteristic(Characteristic.TargetHeatingCoolingState, target_state);
-    }
+    this.target_state = target_state;
+    this.service.updateCharacteristic(Characteristic.TargetHeatingCoolingState, target_state);
   }
+};
+
+ThermostatAccessory.prototype.updateState = function () {
+  return this.refreshState();
+};
+
+// Answers from the cached state when it is fresh, and refreshes it in the background:
+// HomeKit is notified through updateCharacteristic if it has changed
+ThermostatAccessory.prototype.getCachedState = async function (key) {
+  if (this[key] === null || !this.reachable) {
+    await this.refreshState();
+  } else {
+    this.refreshState();
+  }
+  return this.reachable ? this[key] : null;
 };
 
 ThermostatAccessory.prototype.handleCurrentHeatingCoolingStateGet = async function (
   callback
 ) {
-  const state = await getCurrentState(this);
+  const state = await this.getCachedState("current_state");
   if (this.trace) {
     this.log("HomeKit asked for current state (0 for stop or fro, 1 for cft, 2 for eco): " + state);
   }
-  if (state != null) {
-    this.heatingCoolingState = state;
+  if (state !== null) {
     callback(null, state);
   } else {
     this.log("Error : Unavailable state");
-    callback(true);
+    callback(new Error("Unavailable state"));
   }
 };
 
 ThermostatAccessory.prototype.handleTargetHeatingCoolingStateGet = async function (
   callback
 ) {
-  const state = await getTargetState(this);
+  const state = await this.getCachedState("target_state");
   if (this.trace) {
     this.log("HomeKit asked for target state (0 for stop or fro, 1 for cft, 2 for eco, 3 for prog): " + state);
   }
-  if (state != null) {
+  if (state !== null) {
     callback(null, state);
   } else {
     this.log("Error : Unavailable state");
-    callback(true);
+    callback(new Error("Unavailable state"));
   }
 };
 
@@ -361,12 +325,23 @@ ThermostatAccessory.prototype.handleTargetHeatingCoolingStateSet = async functio
   if (this.trace) {
     this.log("HomeKit changed target state to (0 for stop or fro, 1 for cft, 2 for eco, 3 for prog): " + state);
   }
-  if (state != null) {
-    callback(null, state);
-  } else {
+  clearTimeout(this.confirmTimer);
+  if (state === null) {
     this.log("Error - Cannot change state");
-    callback(true);
+    callback(new Error("Cannot change state"));
+    this.ignoreUpdatesUntil = 0;
+    this.refreshState(); // The command may have been partially applied: show the real state
+    return;
   }
+
+  callback(null);
+  this.ignoreUpdatesUntil = Date.now() + confirmDelay;
+  this.target_state = state;
+  if (state !== Characteristic.TargetHeatingCoolingState.AUTO) {
+    this.applyState(state, state);
+  }
+  // Read the real state once Heatzy servers have taken the change into account
+  this.confirmTimer = setTimeout(this.refreshState.bind(this), confirmDelay + 100);
 };
 
 ThermostatAccessory.prototype.handleCurrentTemperatureGet = function (
@@ -388,12 +363,17 @@ ThermostatAccessory.prototype.handleTargetTemperatureGet = function (
 };
 
 ThermostatAccessory.prototype.handleTargetTemperatureSet = function (
+  value,
   callback
 ) {
   if (this.trace) {
-    this.log("Set fake temp of " + this.fake_temp + "°");
+    this.log("HomeKit tried to set target temp to " + value + "°, ignored: fake temp stays " + this.fake_temp + "°");
   }
-  callback(null, this.fake_temp);
+  callback(null);
+  // The target temperature is fake: show the configured value again
+  setTimeout(() => {
+    this.service.updateCharacteristic(Characteristic.TargetTemperature, this.fake_temp);
+  }, 1000);
 };
 
 ThermostatAccessory.prototype.handleTemperatureDisplayUnitsGet = function (
@@ -406,12 +386,16 @@ ThermostatAccessory.prototype.handleTemperatureDisplayUnitsGet = function (
 };
 
 ThermostatAccessory.prototype.handleTemperatureDisplayUnitsSet = function (
+  value,
   callback
 ) {
   if (this.trace) {
-    this.log("Set fake temp unit (0 for °C, 1 for °F): " + this.temp_unit);
+    this.log("HomeKit tried to set temp unit to " + value + ", ignored: fake temp unit stays (0 for °C, 1 for °F) " + this.temp_unit);
   }
-  callback(null, this.temp_unit);
+  callback(null);
+  setTimeout(() => {
+    this.service.updateCharacteristic(Characteristic.TemperatureDisplayUnits, this.temp_unit);
+  }, 1000);
 };
 
 ThermostatAccessory.prototype.getServices = function () {
