@@ -5,7 +5,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\""
   },
-  "version": "1.0.8",
+  "version": "1.1.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Cteq3132/homebridge-heatzy-pilote-as-thermostat.git"
@@ -13,6 +13,7 @@
   "author": "oxyeez",
   "bundleDependencies": false,
   "dependencies": {
+    "@homebridge/plugin-ui-utils": "^2.2.6",
     "axios": "^0.19.0"
   },
   "deprecated": false,
@@ -20,7 +21,7 @@
   "devDependencies": {},
   "engines": {
     "homebridge": ">=0.2.0",
-    "node": ">=0.12.0"
+    "node": ">=18"
   },
   "keywords": [
     "homebridge-plugin",

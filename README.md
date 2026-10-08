@@ -28,7 +28,20 @@ For the rest of the functionnalities of the thermostat in the Home app, everythi
 
 Install or update this plugin using `npm i -g @cteq3132/homebridge-heatzy-pilote-as-thermostat`.
 
-Update the `config.json` file of your Homebridge setup, by modifying the sample configuration below.
+The easiest way to configure it is the plugin settings in [Homebridge UI](https://github.com/homebridge/homebridge-config-ui-x): sign in with your Heatzy account, click `Find my devices`, choose the devices to add and save. This also gets the local network passcode of your devices (see [Local mode](#local-mode)).
+
+You can also update the `config.json` file of your Homebridge setup, by modifying the sample configuration below.
+
+
+## Local mode
+
+The plugin controls your devices directly on your local network, with the Gizwits LAN protocol used by Heatzy devices (TCP port 12416). It is faster than Heatzy servers, and keeps working when Heatzy servers or your internet connection are down.
+
+This needs the local network passcode of each device, which can only be obtained from Heatzy servers. It is fetched once, by the setup UI or by the plugin at its first start, and saved in the Homebridge storage folder (`heatzy-pilote/<did>.json`). After that, Heatzy servers are only used as a fallback, when the device cannot be reached on the local network.
+
+The IP address of the device is found automatically on your local network. You can also set it with the `ip` parameter (with a DHCP reservation on your router).
+
+Tested with the Heatzy Pilote (`Pilote_Soc_C3`). Devices that do not support it are controlled through Heatzy servers, as before.
 
 
 ## Configurations
@@ -48,6 +61,7 @@ The configuration parameters to enable your devices would need to be added to `a
                     "interval": 60,
                     "fake_temp": 20,
                     "temp_unit": "C",
+                    "local": true,
                     "trace" : false
                 }
             ]
@@ -61,16 +75,18 @@ The configuration parameters to enable your devices would need to be added to `a
 * `accessory ` is required, with `HeatzyPilote` value.  
 * `name` (required) is anything you'd like to use to identify this device. You can always change the name from within the Home app.
 * `username` and `password` (required) are the credentials you use in the Heatzy app.
-* `did` (required) is the parameter for your device. See below how to get it.
-* `interval` (optional) is how often (in seconds) the plugin will ask Heatzy servers the state of your device, which is necessary when you change the state from outside of Homekit. Default is 60s.
+* `did` (required) is the parameter for your device. The setup UI finds it for you, or see below how to get it.
+* `interval` (optional) is how often (in seconds) the plugin will ask the device (or Heatzy servers) its state, which is necessary when you change the state from outside of Homekit. Default is 60s.
 * `fake_temp` (optional) the fake temperature displayed in the Home app as current and target temperature. Home app accepts values from 10 to 38. Default is 20°.
 * `temp_unit` (optional) the temperature unit used in the Home app, "C" for °C, "F" for °F. Default is °C.
+* `local` (optional) controls the device on the local network, see [Local mode](#local-mode). Set to `false` to only use Heatzy servers. Default is true.
+* `ip` (optional) the IP address of the device on the local network. Default is to find it automatically.
 * `trace` (optional) displays the main events in homebridge log . Default is false.
 
 
 ## How to find the Device ID `did` of your devices
 
-In your terminal, enter the two commands below.
+The setup UI in Homebridge UI does this for you. Otherwise, in your terminal, enter the two commands below.
 
 For the first one, you will have to replace USERNAME and PASSWORD by your credentials used in the Heatzy app.
 In return, you should get a `token` : you will use it in the second command, to replace YOURTOKEN.
