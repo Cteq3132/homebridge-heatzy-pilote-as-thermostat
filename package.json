@@ -1,12 +1,15 @@
 {
   "license": "MIT",
   "main": "index.js",
-  "name": "homebridge-heatzy-pilote-as-thermostat",
+  "name": "@cteq3132/homebridge-heatzy-pilote-as-thermostat",
   "scripts": {
     "test": "echo \"Error: no test specified\""
   },
-  "version": "1.0.2",
-  "repository": "oxyeez/homebridge-heatzy-pilote-as-thermostat",
+  "version": "1.0.8",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Cteq3132/homebridge-heatzy-pilote-as-thermostat.git"
+  },
   "author": "oxyeez",
   "bundleDependencies": false,
   "dependencies": {
@@ -23,5 +26,12 @@
     "homebridge-plugin",
     "Heatzy",
     "thermostat"
-  ]
+  ],
+  "bugs": {
+    "url": "https://github.com/Cteq3132/homebridge-heatzy-pilote-as-thermostat/issues"
+  },
+  "homepage": "https://github.com/Cteq3132/homebridge-heatzy-pilote-as-thermostat#readme",
+  "publishConfig": {
+    "access": "public"
+  }
 }

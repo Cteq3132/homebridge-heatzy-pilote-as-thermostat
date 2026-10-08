@@ -26,7 +26,7 @@ For the rest of the functionnalities of the thermostat in the Home app, everythi
 
 ## Installation
 
-Install or update this plugin using `npm i -g homebridge-heatzy-as-thermostat`.
+Install or update this plugin using `npm i -g @cteq3132/homebridge-heatzy-pilote-as-thermostat`.
 
 Update the `config.json` file of your Homebridge setup, by modifying the sample configuration below.
 
