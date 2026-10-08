@@ -504,9 +504,14 @@ async function setLocalTargetState(device, state) {
   if (state !== 3) {
     attrs.mode = (state === 0) ? "stop" : (state === 1 ? "cft" : "eco");
   }
+  const schema = device.localState.schema;
   await withLocalSession(device, async (session) => {
     const status = await session.read();
-    await session.write(device.localState.schema, status, attrs);
+    const sent = await session.write(schema, status, attrs);
+    if (device.trace) {
+      device.log("LAN write " + JSON.stringify(attrs) + ": status read " + status.toString("hex") +
+        ", sent " + sent.request.toString("hex") + ", acknowledged with " + sent.ack.toString("hex"));
+    }
   });
   return state;
 }

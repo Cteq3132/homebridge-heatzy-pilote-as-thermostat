@@ -175,7 +175,8 @@ Session.prototype.read = async function () {
   return Buffer.from(f.payload.slice(offset + 1));
 };
 
-// attrs: { name: value }. The whole writable status is sent, copied from current, flags select what is written
+// attrs: { name: value }. The whole writable status is sent, copied from current, flags select what is written.
+// Returns the P0 sent and the payload of the acknowledgement, for traces
 Session.prototype.write = async function (schema, current, attrs) {
   const status = Buffer.from(current.slice(0, schema.writableLength));
   const flags = Buffer.alloc(schema.flagsLength);
@@ -184,7 +185,9 @@ Session.prototype.write = async function (schema, current, attrs) {
     encodeAttr(status, attr, attrs[name]);
     flags[schema.flagsLength - 1 - (attr.id >> 3)] |= 1 << (attr.id & 7);
   }
-  await this.p0(Buffer.concat([Buffer.from([P0_WRITE]), flags, status]));
+  const request = Buffer.concat([Buffer.from([P0_WRITE]), flags, status]);
+  const ack = await this.p0(request);
+  return { request, ack: ack.payload };
 };
 
 Session.prototype.close = function () {
