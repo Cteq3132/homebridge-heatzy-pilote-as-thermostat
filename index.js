@@ -12,6 +12,7 @@ const heatzy_Application_Id = "c70a66ff039d41b4a220e198b0fcc8b3";
 const requestTimeout = 10000; // ms, without it a request to Heatzy servers can hang forever
 const confirmDelay = 10000; // ms, time for Heatzy servers to reflect a change made from HomeKit
 const localConfirmDelay = 1000; // ms, a change made on the local network is reflected at once
+const localWriteDelay = 500; // ms, between leaving Prog and changing the mode on the local network
 const localInfoRetryDelay = 10 * 60 * 1000; // ms, between two attempts to get the passcode from Heatzy servers
 const discoveryRetryDelay = 5 * 60 * 1000; // ms, between two searches of the device on the local network
 const tokenWarningDelay = 14 * 24 * 3600 * 1000; // ms, warn at startup when the token expires sooner
@@ -500,17 +501,28 @@ async function getLocalDeviceState(device) {
 }
 
 async function setLocalTargetState(device, state) {
-  const attrs = { timer_switch: state === 3 ? 1 : 0 };
+  // Leaving Prog first restores the manual mode, which is then changed
+  const changes = [["timer_switch", state === 3 ? 1 : 0]];
   if (state !== 3) {
-    attrs.mode = (state === 0) ? "stop" : (state === 1 ? "cft" : "eco");
+    changes.push(["mode", (state === 0) ? "stop" : (state === 1 ? "cft" : "eco")]);
   }
   const schema = device.localState.schema;
   await withLocalSession(device, async (session) => {
-    const status = await session.read();
-    const sent = await session.write(schema, status, attrs);
-    if (device.trace) {
-      device.log("LAN write " + JSON.stringify(attrs) + ": status read " + status.toString("hex") +
-        ", sent " + sent.request.toString("hex") + ", acknowledged with " + sent.ack.toString("hex"));
+    // The device only applies one attribute per write: a mode sent with timer_switch is ignored
+    let status = await session.read();
+    for (const [name, value] of changes) {
+      // The mode is always sent: leaving Prog changes it, maybe not yet in this status
+      if (name === "timer_switch" && lan.decodeAttr(status, schema.attrs[name]) === value) continue;
+      const sent = await session.write(schema, status, { [name]: value });
+      if (device.trace) {
+        device.log("LAN write " + name + "=" + value + ": status read " + status.toString("hex") +
+          ", sent " + sent.request.toString("hex") + ", acknowledged with " + sent.ack.toString("hex"));
+      }
+      if (name === "timer_switch" && changes.length > 1) {
+        // Let the device restore its manual mode before it is changed
+        await new Promise((resolve) => setTimeout(resolve, localWriteDelay));
+        status = await session.read();
+      }
     }
   });
   return state;
