@@ -5,27 +5,25 @@
   "scripts": {
     "test": "echo \"Error: no test specified\""
   },
-  "version": "1.1.0",
+  "version": "2.0.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Cteq3132/homebridge-heatzy-pilote-as-thermostat.git"
   },
   "author": "oxyeez",
-  "bundleDependencies": false,
   "dependencies": {
     "@homebridge/plugin-ui-utils": "^2.2.6",
-    "axios": "^0.19.0"
+    "axios": "^1.20.0"
   },
-  "deprecated": false,
-  "description": "Use Heatzy as a thermostat between mode  Off (OFF), Confort (HEAT), Eco (COOL) and Prog (AUTO)",
-  "devDependencies": {},
+  "description": "Use Heatzy as a thermostat between mode Off (OFF), Confort (HEAT), Eco (COOL) and Prog (AUTO), on the local network or through Heatzy servers",
   "engines": {
-    "homebridge": ">=0.2.0",
-    "node": ">=18"
+    "homebridge": "^1.8.0 || ^2.0.0",
+    "node": "^22 || ^24"
   },
   "keywords": [
     "homebridge-plugin",
-    "Heatzy",
+    "heatzy",
+    "fil-pilote",
     "thermostat"
   ],
   "bugs": {

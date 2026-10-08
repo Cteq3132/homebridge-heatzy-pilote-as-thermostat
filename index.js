@@ -1,6 +1,5 @@
 "use strict";
 
-const url = require("url");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
@@ -9,38 +8,246 @@ const lan = require("./lan");
 // From Heatzy API : https://drive.google.com/drive/folders/0B9nVzuTl4YMOaXAzRnRhdXVma1k
 // https://heatzy.com/blog/tout-sur-heatzy
 const heatzyUrl = "https://euapi.gizwits.com/app/";
-const loginUrl = url.parse(heatzyUrl + "login");
 const heatzy_Application_Id = "c70a66ff039d41b4a220e198b0fcc8b3";
 const requestTimeout = 10000; // ms, without it a request to Heatzy servers can hang forever
 const confirmDelay = 10000; // ms, time for Heatzy servers to reflect a change made from HomeKit
 const localConfirmDelay = 1000; // ms, a change made on the local network is reflected at once
 const localInfoRetryDelay = 10 * 60 * 1000; // ms, between two attempts to get the passcode from Heatzy servers
 const discoveryRetryDelay = 5 * 60 * 1000; // ms, between two searches of the device on the local network
+const tokenWarningDelay = 14 * 24 * 3600 * 1000; // ms, warn at startup when the token expires sooner
 
-let Service, Characteristic, storagePath;
+const PLUGIN_NAME = require("./package.json").name;
+const PLATFORM_NAME = "HeatzyPilote";
 
-module.exports = (homebridge) => {
-  /* this is the starting point for the plugin where we register the accessory */
-  Service = homebridge.hap.Service;
-  Characteristic = homebridge.hap.Characteristic;
-  storagePath = path.join(homebridge.user.storagePath(), "heatzy-pilote");
-  homebridge.registerAccessory(
-    "homebridge-heatzy-as-Thermostat",
-    "HeatzyPilote",
-    ThermostatAccessory
-  );
+let Service, Characteristic, HapStatusError, HAPStatus, storagePath;
+
+// UUIDs of the heaters still configured in the "accessories" section (before version 2),
+// so that the platform does not publish them a second time
+const legacyUuids = new Set();
+
+module.exports = (api) => {
+  /* this is the starting point for the plugin where we register the platform */
+  Service = api.hap.Service;
+  Characteristic = api.hap.Characteristic;
+  HapStatusError = api.hap.HapStatusError;
+  HAPStatus = api.hap.HAPStatus;
+  storagePath = path.join(api.user.storagePath(), "heatzy-pilote");
+  api.registerPlatform(PLATFORM_NAME, HeatzyPlatform);
+  // Configurations made before version 2 keep working until they are migrated by the setup UI
+  api.registerAccessory(PLATFORM_NAME, LegacyAccessory);
 };
 
-function ThermostatAccessory(log, config) {
+// The UUID that Homebridge gave to the heater when it was an accessory (before version 2):
+// keeping it keeps the rooms, scenes and automations of the heater in HomeKit
+function heaterUuid(api, name) {
+  return api.hap.uuid.generate(PLATFORM_NAME + ":" + name);
+}
+
+// Logs of a heater, prefixed with its name
+function heaterLog(log, name) {
+  const prefix = "[" + name + "] ";
+  const heater = (message) => log.info(prefix + message);
+  heater.info = heater;
+  heater.warn = (message) => log.warn(prefix + message);
+  heater.error = (message) => log.error(prefix + message);
+  return heater;
+}
+
+function HeatzyPlatform(log, config, api) {
+  this.log = log;
+  this.config = config || {};
+  this.api = api;
+  this.cachedAccessories = new Map();
+  this.legacyDuplicates = [];
+  this.heaters = [];
+
+  api.on("didFinishLaunching", () => this.publishHeaters());
+  api.on("shutdown", () => this.heaters.forEach((heater) => heater.stop()));
+}
+
+// Called by Homebridge for each heater restored from its cache
+HeatzyPlatform.prototype.configureAccessory = function (accessory) {
+  // Configured again in the accessories section: two accessories with the same UUID cannot be published
+  if (legacyUuids.has(accessory.UUID)) {
+    this.legacyDuplicates.push(accessory);
+    return;
+  }
+  this.cachedAccessories.set(accessory.UUID, accessory);
+};
+
+HeatzyPlatform.prototype.publishHeaters = function () {
+  // Homebridge 1 restores them next to the heater of the accessories section, Homebridge 2 drops them
+  for (const accessory of this.legacyDuplicates) {
+    try {
+      this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+    } catch (error) {
+      // Not on the bridge
+    }
+  }
+
+  const devices = Array.isArray(this.config.devices) ? this.config.devices : [];
+  const auth = new TokenAuth(this.log, this.config.token, this.config.token_expire_at);
+  if (devices.length === 0) {
+    this.log.warn("No heater configured: open the plugin settings to add your Heatzy devices");
+  } else {
+    auth.logValidity();
+  }
+
+  const published = new Set();
+  const added = [];
+  for (const device of devices) {
+    if (!device || !device.name || !device.did) {
+      this.log.error("A heater is missing its name or its did, ignored: " + JSON.stringify(device && device.name));
+      continue;
+    }
+    const uuid = heaterUuid(this.api, device.uuid_base || device.name);
+    if (legacyUuids.has(uuid)) {
+      this.log.warn("[" + device.name + "] Also configured in the accessories section, ignored here");
+      continue;
+    }
+    if (published.has(uuid)) {
+      this.log.error("[" + device.name + "] Two heaters have this name, the second one is ignored");
+      continue;
+    }
+    published.add(uuid);
+
+    let accessory = this.cachedAccessories.get(uuid);
+    if (!accessory) {
+      accessory = new this.api.platformAccessory(device.name, uuid);
+      added.push(accessory);
+    }
+    accessory.context.did = device.did;
+    const service = accessory.getService(Service.Thermostat) || accessory.addService(Service.Thermostat, device.name);
+    accessory.getService(Service.AccessoryInformation)
+      .setCharacteristic(Characteristic.Manufacturer, "Heatzy")
+      .setCharacteristic(Characteristic.Model, "Heatzy Pilote V2")
+      .setCharacteristic(Characteristic.SerialNumber, device.did);
+    this.heaters.push(new HeatzyThermostat(heaterLog(this.log, device.name), device, auth, service));
+  }
+
+  if (added.length > 0) {
+    this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, added);
+  }
+  const removed = [...this.cachedAccessories.values()].filter((accessory) => !published.has(accessory.UUID));
+  if (removed.length > 0) {
+    this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, removed);
+  }
+};
+
+// A heater configured in the "accessories" section, before version 2
+function LegacyAccessory(log, config, api) {
+  legacyUuids.add(heaterUuid(api, config.uuid_base || config.name));
+  log.warn(
+    "This heater uses the configuration of version 1, with your Heatzy password. " +
+    "Open the plugin settings in Homebridge UI and click Save to migrate it: only a token will be kept"
+  );
+  this.informationService = new Service.AccessoryInformation()
+    .setCharacteristic(Characteristic.Manufacturer, "Heatzy")
+    .setCharacteristic(Characteristic.Model, "Heatzy Pilote V2")
+    .setCharacteristic(Characteristic.SerialNumber, config.did || "unknown");
+  const auth = new PasswordAuth(log, config.username, config.password);
+  this.heater = new HeatzyThermostat(log, config, auth, new Service.Thermostat(config.name));
+  api.on("shutdown", () => this.heater.stop());
+}
+
+LegacyAccessory.prototype.getServices = function () {
+  return [this.informationService, this.heater.service];
+};
+
+// Heatzy token saved in the config by the setup UI: the account password is never stored.
+// It cannot be renewed without the password: once expired, only the local mode works
+function TokenAuth(log, token, expireAt) {
+  this.log = log;
+  this.token = token || null;
+  this.expireAt = expireAt ? expireAt * 1000 : Infinity;
+  this.warned = false;
+}
+
+TokenAuth.prototype.logValidity = function () {
+  if (!this.token) {
+    this.warned = true;
+    this.log.warn("No Heatzy token, Heatzy servers cannot be used: open the plugin settings and sign in to your Heatzy account");
+  } else if (this.expireAt === Infinity) {
+    this.log.info("Heatzy token without expiry date");
+  } else if (this.expireAt <= Date.now()) {
+    this.warned = true;
+    this.log.warn("The Heatzy token expired on " + new Date(this.expireAt).toLocaleString() +
+      ", Heatzy servers cannot be used: open the plugin settings and sign in again");
+  } else if (this.expireAt < Date.now() + tokenWarningDelay) {
+    this.log.warn("The Heatzy token expires on " + new Date(this.expireAt).toLocaleString() +
+      ": open the plugin settings and sign in again");
+  } else {
+    this.log.info("Heatzy token valid until " + new Date(this.expireAt).toLocaleString());
+  }
+};
+
+// Returns the token, or null when there is none
+TokenAuth.prototype.getToken = async function () {
+  if (this.token && Date.now() < this.expireAt) return this.token;
+  if (!this.warned) {
+    this.warned = true;
+    this.log.warn((this.token ? "The Heatzy token has expired" : "No Heatzy token") +
+      ", Heatzy servers cannot be used: open the plugin settings and sign in to your Heatzy account");
+  }
+  return null;
+};
+
+// Heatzy servers answered 400: the token may have been revoked
+TokenAuth.prototype.rejected = function () {
+  if (!this.warned) {
+    this.warned = true;
+    this.log.warn("Heatzy servers rejected the request: if the token is no longer valid, " +
+      "open the plugin settings and sign in to your Heatzy account");
+  }
+};
+
+// Login with the email and password of the Heatzy account (configuration of version 1)
+function PasswordAuth(log, username, password) {
+  this.log = log;
+  this.username = username;
+  this.password = password;
+  this.token = null;
+  this.expireAt = 0;
+}
+
+PasswordAuth.prototype.getToken = async function () {
+  if (this.expireAt < Date.now()) {
+    try {
+      const response = await axios.post(heatzyUrl + "login", {
+        username: this.username,
+        password: this.password,
+        lang: "en",
+      }, {
+        timeout: requestTimeout,
+        headers: { "X-Gizwits-Application-Id": heatzy_Application_Id },
+      });
+      this.token = response.data.token;
+      this.expireAt = response.data.expire_at * 1000;
+    } catch (error) {
+      // Never throw from here: an exception would become an unhandled rejection and crash Homebridge
+      this.log("Error : " + describeError(error));
+      this.log("Error - Plugin unable to login to Heatzy server");
+      return null;
+    }
+  }
+  return this.token;
+};
+
+// Token probably revoked: force a new login on next request
+PasswordAuth.prototype.rejected = function () {
+  this.expireAt = 0;
+};
+
+function HeatzyThermostat(log, config, auth, service) {
   this.log = log;
   this.config = config;
+  this.auth = auth;
+  this.service = service;
 
   // Config
-  this.getUrl = url.parse(heatzyUrl + "devdata/" + config["did"] + "/latest");
-  this.postUrl = url.parse(heatzyUrl + "control/" + config["did"]);
+  this.getUrl = heatzyUrl + "devdata/" + config["did"] + "/latest";
+  this.postUrl = heatzyUrl + "control/" + config["did"];
   this.name = config["name"];
-  this.username = config["username"];
-  this.password = config["password"];
   this.interval = config["interval"] || 60;
   this.fake_temp = config["fake_temp"] >= 10 && config["fake_temp"] <= 38 ? config["fake_temp"] : 20;
   this.temp_unit = config["temp_unit"] === "F" ? 1 : 0;
@@ -58,10 +265,6 @@ function ThermostatAccessory(log, config) {
   this.localWorking = null;
   this.lastWriteLocal = false;
 
-  // Heatzy token
-  this.heatzyToken = "";
-  this.heatzyTokenExpire_at = Date.now() - 10000; // Initial value is 10s in the past, to force login and refresh of token
-
   this.current_state = null;
   this.target_state = null;
   this.reachable = false;
@@ -69,74 +272,44 @@ function ThermostatAccessory(log, config) {
   this.ignoreUpdatesUntil = 0;
   this.confirmTimer = null;
 
-  this.informationService = new Service.AccessoryInformation()
-    .setCharacteristic(Characteristic.Manufacturer, "Heatzy")
-    .setCharacteristic(Characteristic.Model, "Heatzy Pilote V2")
-    .setCharacteristic(Characteristic.SerialNumber, "unknown");
-  this.service = new Service.Thermostat(this.config.name);
-
   this.service
     .getCharacteristic(Characteristic.CurrentHeatingCoolingState)
-    .on("get", this.handleCurrentHeatingCoolingStateGet.bind(this));
+    .onGet(this.handleCurrentHeatingCoolingStateGet.bind(this));
 
   this.service
     .getCharacteristic(Characteristic.TargetHeatingCoolingState)
-    .on("get", this.handleTargetHeatingCoolingStateGet.bind(this))
-    .on("set", this.handleTargetHeatingCoolingStateSet.bind(this));
+    .onGet(this.handleTargetHeatingCoolingStateGet.bind(this))
+    .onSet(this.handleTargetHeatingCoolingStateSet.bind(this));
 
   this.service
     .getCharacteristic(Characteristic.CurrentTemperature)
-    .on("get", this.handleCurrentTemperatureGet.bind(this));
+    .onGet(this.handleCurrentTemperatureGet.bind(this));
 
   this.service
     .getCharacteristic(Characteristic.TargetTemperature)
-    .on("get", this.handleTargetTemperatureGet.bind(this))
-    .on("set", this.handleTargetTemperatureSet.bind(this));
+    .onGet(this.handleTargetTemperatureGet.bind(this))
+    .onSet(this.handleTargetTemperatureSet.bind(this));
 
   this.service
     .getCharacteristic(Characteristic.TemperatureDisplayUnits)
-    .on("get", this.handleTemperatureDisplayUnitsGet.bind(this))
-    .on("set", this.handleTemperatureDisplayUnitsSet.bind(this));
+    .onGet(this.handleTemperatureDisplayUnitsGet.bind(this))
+    .onSet(this.handleTemperatureDisplayUnitsSet.bind(this));
 
   this.updateState(); // Get the current state of the device, and update HomeKit
-  setInterval(this.updateState.bind(this), this.interval * 1000); // The state of the device will be checked every this.interval seconds
+  this.timer = setInterval(this.updateState.bind(this), this.interval * 1000); // The state of the device will be checked every this.interval seconds
   this.log("starting HeatzyPilote...");
 }
 
-async function updateToken(device) {
-  try {
-    const response = await axios({
-      method: "post",
-      url: loginUrl,
-      timeout: requestTimeout,
-      headers: {
-        "X-Gizwits-Application-Id": heatzy_Application_Id,
-      },
-      data: {
-        username: device.username,
-        password: device.password,
-        lang: "en",
-      },
-    });
-    if (response.status == 200) {
-      device.heatzyToken = response.data.token;
-      device.heatzyTokenExpire_at = response.data.expire_at * 1000;
-    } else {
-      device.log(
-        `${response.status} ${response.statusText} ${response.data.error_message}`
-      );
-    }
-  } catch (error) {
-    // Never throw from here: an exception would become an unhandled rejection and crash Homebridge
-    device.log("Error : " + describeError(error));
-    device.log("Error - Plugin unable to login to Heatzy server");
-  }
-}
+HeatzyThermostat.prototype.stop = function () {
+  clearInterval(this.timer);
+  clearTimeout(this.confirmTimer);
+};
 
-async function ensureToken(device) {
-  if (device.heatzyTokenExpire_at < Date.now()) {
-    await updateToken(device);
-  }
+function heatzyHeaders(token) {
+  return {
+    "X-Gizwits-Application-Id": heatzy_Application_Id,
+    "X-Gizwits-User-token": token,
+  };
 }
 
 // Network errors (timeout, DNS, connection reset...) have no response
@@ -196,13 +369,11 @@ function saveLocalState(device) {
 }
 
 async function cloudGet(device, endpoint) {
-  await ensureToken(device);
+  const token = await device.auth.getToken();
+  if (!token) throw new Error("not signed in to Heatzy");
   const response = await axios.get(heatzyUrl + endpoint, {
     timeout: requestTimeout,
-    headers: {
-      "X-Gizwits-Application-Id": heatzy_Application_Id,
-      "X-Gizwits-User-token": device.heatzyToken,
-    },
+    headers: heatzyHeaders(token),
   });
   return response.data;
 }
@@ -355,27 +526,18 @@ async function getDeviceState(device) {
 }
 
 async function getCloudDeviceState(device) {
-  await ensureToken(device);
+  const token = await device.auth.getToken();
+  if (!token) return null;
 
   try {
     const response = await axios.get(device.getUrl, {
       timeout: requestTimeout,
-      headers: {
-        "X-Gizwits-Application-Id": heatzy_Application_Id,
-        "X-Gizwits-User-token": device.heatzyToken,
-      },
+      headers: heatzyHeaders(token),
     });
-    if (response.status != 200) {
-      device.log(
-        `${response.status} ${response.statusText} ${response.data.error_message}`
-      );
-      return null;
-    }
     return stateFromAttrs(device, response.data.attr.mode, response.data.attr.timer_switch);
   } catch (error) {
     if (error && error.response && error.response.status == 400) {
-      // Token probably revoked: force a new login on next request
-      device.heatzyTokenExpire_at = Date.now() - 10000;
+      device.auth.rejected();
     }
     device.log("Error : " + describeError(error));
     return null;
@@ -406,34 +568,19 @@ async function setCloudTargetState(device, state) {
 }
 
 async function sendCommand(device, attrs) {
-  await ensureToken(device);
+  const token = await device.auth.getToken();
+  if (!token) return false;
 
   try {
-    const response = await axios({
-      method: "post",
-      url: device.postUrl,
+    await axios.post(device.postUrl, { attrs: attrs }, {
       timeout: requestTimeout,
-      headers: {
-        "X-Gizwits-Application-Id": heatzy_Application_Id,
-        "X-Gizwits-User-token": device.heatzyToken,
-      },
-      data: {
-        attrs: attrs,
-      },
+      headers: heatzyHeaders(token),
     });
-    if (response.status != 200) {
-      device.log(
-        "Error - returned code not 200: " +
-        response.status +
-        " " +
-        response.statusText +
-        " " +
-        response.data.error_message
-      );
-      return false;
-    }
     return true;
   } catch (error) {
+    if (error && error.response && error.response.status == 400) {
+      device.auth.rejected();
+    }
     device.log("Error : " + describeError(error));
     return false;
   }
@@ -451,7 +598,7 @@ async function setTargetProgState(device, state) {
 
 // Reads the state from Heatzy and notifies HomeKit of any change.
 // Concurrent calls share the same request. Never rejects.
-ThermostatAccessory.prototype.refreshState = function () {
+HeatzyThermostat.prototype.refreshState = function () {
   if (!this.refreshing) {
     this.refreshing = (async () => {
       try {
@@ -472,7 +619,7 @@ ThermostatAccessory.prototype.refreshState = function () {
   return this.refreshing;
 };
 
-ThermostatAccessory.prototype.applyState = function (current_state, target_state) {
+HeatzyThermostat.prototype.applyState = function (current_state, target_state) {
   if (current_state !== this.current_state) {
     if (this.current_state !== null) {
       this.log("Current state has changed from: " + this.current_state + " to " + current_state);
@@ -490,13 +637,13 @@ ThermostatAccessory.prototype.applyState = function (current_state, target_state
   }
 };
 
-ThermostatAccessory.prototype.updateState = function () {
+HeatzyThermostat.prototype.updateState = function () {
   return this.refreshState();
 };
 
 // Answers from the cached state when it is fresh, and refreshes it in the background:
 // HomeKit is notified through updateCharacteristic if it has changed
-ThermostatAccessory.prototype.getCachedState = async function (key) {
+HeatzyThermostat.prototype.getCachedState = async function (key) {
   if (this[key] === null || !this.reachable) {
     await this.refreshState();
   } else {
@@ -505,40 +652,31 @@ ThermostatAccessory.prototype.getCachedState = async function (key) {
   return this.reachable ? this[key] : null;
 };
 
-ThermostatAccessory.prototype.handleCurrentHeatingCoolingStateGet = async function (
-  callback
-) {
+HeatzyThermostat.prototype.handleCurrentHeatingCoolingStateGet = async function () {
   const state = await this.getCachedState("current_state");
   if (this.trace) {
     this.log("HomeKit asked for current state (0 for stop or fro, 1 for cft, 2 for eco): " + state);
   }
-  if (state !== null) {
-    callback(null, state);
-  } else {
+  if (state === null) {
     this.log("Error : Unavailable state");
-    callback(new Error("Unavailable state"));
+    throw new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
   }
+  return state;
 };
 
-ThermostatAccessory.prototype.handleTargetHeatingCoolingStateGet = async function (
-  callback
-) {
+HeatzyThermostat.prototype.handleTargetHeatingCoolingStateGet = async function () {
   const state = await this.getCachedState("target_state");
   if (this.trace) {
     this.log("HomeKit asked for target state (0 for stop or fro, 1 for cft, 2 for eco, 3 for prog): " + state);
   }
-  if (state !== null) {
-    callback(null, state);
-  } else {
+  if (state === null) {
     this.log("Error : Unavailable state");
-    callback(new Error("Unavailable state"));
+    throw new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
   }
+  return state;
 };
 
-ThermostatAccessory.prototype.handleTargetHeatingCoolingStateSet = async function (
-  value,
-  callback
-) {
+HeatzyThermostat.prototype.handleTargetHeatingCoolingStateSet = async function (value) {
   const state = await setTargetState(this, value);
   if (this.trace) {
     this.log("HomeKit changed target state to (0 for stop or fro, 1 for cft, 2 for eco, 3 for prog): " + state);
@@ -546,13 +684,11 @@ ThermostatAccessory.prototype.handleTargetHeatingCoolingStateSet = async functio
   clearTimeout(this.confirmTimer);
   if (state === null) {
     this.log("Error - Cannot change state");
-    callback(new Error("Cannot change state"));
     this.ignoreUpdatesUntil = 0;
     this.refreshState(); // The command may have been partially applied: show the real state
-    return;
+    throw new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
   }
 
-  callback(null);
   const delay = this.lastWriteLocal ? localConfirmDelay : confirmDelay;
   this.ignoreUpdatesUntil = Date.now() + delay;
   this.target_state = state;
@@ -563,61 +699,42 @@ ThermostatAccessory.prototype.handleTargetHeatingCoolingStateSet = async functio
   this.confirmTimer = setTimeout(this.refreshState.bind(this), delay + 100);
 };
 
-ThermostatAccessory.prototype.handleCurrentTemperatureGet = function (
-  callback
-) {
+HeatzyThermostat.prototype.handleCurrentTemperatureGet = function () {
   if (this.trace) {
     this.log("Give fake current temp of " + this.fake_temp + "°");
   }
-  callback(null, this.fake_temp);
+  return this.fake_temp;
 };
 
-ThermostatAccessory.prototype.handleTargetTemperatureGet = function (
-  callback
-) {
+HeatzyThermostat.prototype.handleTargetTemperatureGet = function () {
   if (this.trace) {
     this.log("Give fake target temp of " + this.fake_temp + "°");
   }
-  callback(null, this.fake_temp);
+  return this.fake_temp;
 };
 
-ThermostatAccessory.prototype.handleTargetTemperatureSet = function (
-  value,
-  callback
-) {
+HeatzyThermostat.prototype.handleTargetTemperatureSet = function (value) {
   if (this.trace) {
     this.log("HomeKit tried to set target temp to " + value + "°, ignored: fake temp stays " + this.fake_temp + "°");
   }
-  callback(null);
   // The target temperature is fake: show the configured value again
   setTimeout(() => {
     this.service.updateCharacteristic(Characteristic.TargetTemperature, this.fake_temp);
   }, 1000);
 };
 
-ThermostatAccessory.prototype.handleTemperatureDisplayUnitsGet = function (
-  callback
-) {
+HeatzyThermostat.prototype.handleTemperatureDisplayUnitsGet = function () {
   if (this.trace) {
     this.log("Get fake temp unit (0 for °C, 1 for °F): " + this.temp_unit);
   }
-  callback(null, this.temp_unit);
+  return this.temp_unit;
 };
 
-ThermostatAccessory.prototype.handleTemperatureDisplayUnitsSet = function (
-  value,
-  callback
-) {
+HeatzyThermostat.prototype.handleTemperatureDisplayUnitsSet = function (value) {
   if (this.trace) {
     this.log("HomeKit tried to set temp unit to " + value + ", ignored: fake temp unit stays (0 for °C, 1 for °F) " + this.temp_unit);
   }
-  callback(null);
   setTimeout(() => {
     this.service.updateCharacteristic(Characteristic.TemperatureDisplayUnits, this.temp_unit);
   }, 1000);
-};
-
-ThermostatAccessory.prototype.getServices = function () {
-  this.log("Init Services...");
-  return [this.service, this.informationService];
 };

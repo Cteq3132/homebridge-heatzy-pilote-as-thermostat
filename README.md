@@ -26,9 +26,11 @@ For the rest of the functionnalities of the thermostat in the Home app, everythi
 
 ## Installation
 
-Install or update this plugin using `npm i -g @cteq3132/homebridge-heatzy-pilote-as-thermostat`.
+Install or update this plugin using `npm i -g @cteq3132/homebridge-heatzy-pilote-as-thermostat`, or search for it in the plugins of [Homebridge UI](https://github.com/homebridge/homebridge-config-ui-x).
 
-The easiest way to configure it is the plugin settings in [Homebridge UI](https://github.com/homebridge/homebridge-config-ui-x): sign in with your Heatzy account, click `Find my devices`, choose the devices to add and save. This also gets the local network passcode of your devices (see [Local mode](#local-mode)).
+The easiest way to configure it is the plugin settings in Homebridge UI: sign in with your Heatzy account, click `Find my devices`, choose the devices to add and save. This also gets the local network passcode of your devices (see [Local mode](#local-mode)).
+
+Your Heatzy password is not saved: it is only sent to Heatzy servers to sign in, and the token they return is saved in the config (see [Heatzy token](#heatzy-token)).
 
 You can also update the `config.json` file of your Homebridge setup, by modifying the sample configuration below.
 
@@ -44,25 +46,38 @@ The IP address of the device is found automatically on your local network. You c
 Tested with the Heatzy Pilote (`Pilote_Soc_C3`). Devices that do not support it are controlled through Heatzy servers, as before.
 
 
+## Heatzy token
+
+Heatzy servers give a token when you sign in. The plugin uses it instead of your password, which is never stored. It is valid until the date shown in the plugin settings and in the Homebridge log at startup, and cannot be renewed without your password: when it is about to expire, the plugin writes a warning in the Homebridge log. Open the plugin settings, sign in again and save.
+
+The token is only needed to use Heatzy servers. Once the local network passcode of a device is saved, the device keeps working on your local network with an expired token.
+
+
 ## Configurations
 
-The configuration parameters to enable your devices would need to be added to `accessories` section of the Homebridge configuration file. One block is necessary for each Heatzy device.
+The configuration parameters need to be added to the `platforms` section of the Homebridge configuration file, with one entry in `devices` for each Heatzy device.
 
 ```json5
 {
     ...
-            "accessories": [
+            "platforms": [
                 {
-                    "accessory": "HeatzyPilote",
-                    "name": "Bedroom heater",
-                    "username": "XXX",
-                    "password": "XXX",
-                    "did": "011233455677899abbcd",
-                    "interval": 60,
-                    "fake_temp": 20,
-                    "temp_unit": "C",
-                    "local": true,
-                    "trace" : false
+                    "platform": "HeatzyPilote",
+                    "name": "Heatzy",
+                    "username": "me@example.com",
+                    "token": "XXX",
+                    "token_expire_at": 1790000000,
+                    "devices": [
+                        {
+                            "name": "Bedroom heater",
+                            "did": "011233455677899abbcd",
+                            "interval": 60,
+                            "fake_temp": 20,
+                            "temp_unit": "C",
+                            "local": true,
+                            "trace": false
+                        }
+                    ]
                 }
             ]
     ...
@@ -72,24 +87,34 @@ The configuration parameters to enable your devices would need to be added to `a
 
 #### Parameters
 
-* `accessory ` is required, with `HeatzyPilote` value.  
-* `name` (required) is anything you'd like to use to identify this device. You can always change the name from within the Home app.
-* `username` and `password` (required) are the credentials you use in the Heatzy app.
-* `did` (required) is the parameter for your device. The setup UI finds it for you, or see below how to get it.
-* `interval` (optional) is how often (in seconds) the plugin will ask the device (or Heatzy servers) its state, which is necessary when you change the state from outside of Homekit. Default is 60s.
-* `fake_temp` (optional) the fake temperature displayed in the Home app as current and target temperature. Home app accepts values from 10 to 38. Default is 20°.
-* `temp_unit` (optional) the temperature unit used in the Home app, "C" for °C, "F" for °F. Default is °C.
-* `local` (optional) controls the device on the local network, see [Local mode](#local-mode). Set to `false` to only use Heatzy servers. Default is true.
-* `ip` (optional) the IP address of the device on the local network. Default is to find it automatically.
-* `trace` (optional) displays the main events in homebridge log . Default is false.
+* `platform` is required, with `HeatzyPilote` value.
+* `name` is the name of the platform in the Homebridge log. Default is `Heatzy`.
+* `username` (optional) the email of your Heatzy account, to fill in the sign in form of the plugin settings.
+* `token` (required) and `token_expire_at` (optional, Unix time in seconds) are given by Heatzy servers when you sign in, see [Heatzy token](#heatzy-token). The plugin settings fill them in for you, or see below how to get them.
+* `devices` the list of your Heatzy devices, with for each one:
+  * `name` (required) is anything you'd like to use to identify this device. You can always change the name from within the Home app. Changing it here makes it a new accessory in HomeKit.
+  * `did` (required) is the parameter for your device. The setup UI finds it for you, or see below how to get it.
+  * `interval` (optional) is how often (in seconds) the plugin will ask the device (or Heatzy servers) its state, which is necessary when you change the state from outside of Homekit. Default is 60s.
+  * `fake_temp` (optional) the fake temperature displayed in the Home app as current and target temperature. Home app accepts values from 10 to 38. Default is 20°.
+  * `temp_unit` (optional) the temperature unit used in the Home app, "C" for °C, "F" for °F. Default is °C.
+  * `local` (optional) controls the device on the local network, see [Local mode](#local-mode). Set to `false` to only use Heatzy servers. Default is true.
+  * `ip` (optional) the IP address of the device on the local network. Default is to find it automatically.
+  * `trace` (optional) displays the main events in homebridge log . Default is false.
 
 
-## How to find the Device ID `did` of your devices
+## Updating from version 1
+
+Before version 2, each device was configured in the `accessories` section, with your Heatzy email and password. These devices keep working after the update, with a warning in the Homebridge log.
+
+To migrate them, open the plugin settings in Homebridge UI, check your devices and click `Save`, then restart Homebridge: the devices move to the `platforms` section, and your password is removed from the config. They keep the same identifiers, so their rooms, scenes and automations are kept in HomeKit.
+
+
+## How to find the token and the Device ID `did` of your devices
 
 The setup UI in Homebridge UI does this for you. Otherwise, in your terminal, enter the two commands below.
 
 For the first one, you will have to replace USERNAME and PASSWORD by your credentials used in the Heatzy app.
-In return, you should get a `token` : you will use it in the second command, to replace YOURTOKEN.
+In return, you should get a `token` and its expiry date `expire_at`: they are the `token` and `token_expire_at` parameters of the config. You will also use the token in the second command, to replace YOURTOKEN.
 
 The second command will return many datas. For each Heatzy device, you must find this piece of information : `"did": "011233455677899abbcd"`. To know wich `did` is for which device, you will find another piece of informatation close to it:` "dev_alias": "Name"`. The Name is the one used in the Heatzy app.
 (You can choose a different name in homebridge configuration file, if you wish).
@@ -102,4 +127,4 @@ The second command will return many datas. For each Heatzy device, you must find
 
 ## Publishing a new version
 
-Bump `version` in `package.json` and merge into `master`: the [Publish to npm](.github/workflows/publish.yml) GitHub Action publishes the package if this version is not on npm yet. It uses npm trusted publishing, configured on npmjs.com in the package settings (Trusted Publisher → GitHub Actions, repository `Cteq3132/homebridge-heatzy-pilote-as-thermostat`, workflow `publish.yml`).
+Bump `version` in `package.json` and merge into `master`: the [Publish to npm](.github/workflows/publish.yml) GitHub Action publishes the package if this version is not on npm yet, and creates the GitHub release `vX.Y.Z` with the list of the pull requests merged since the previous one. It uses npm trusted publishing, configured on npmjs.com in the package settings (Trusted Publisher → GitHub Actions, repository `Cteq3132/homebridge-heatzy-pilote-as-thermostat`, workflow `publish.yml`).

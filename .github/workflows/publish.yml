@@ -1,14 +1,15 @@
 name: Publish to npm
 
 # Publishes the package when the version in package.json is not on npm yet:
-# bump "version" in package.json, merge into master, and the release is published.
+# bump "version" in package.json, merge into master, and the release is published,
+# with a GitHub release whose notes list the pull requests merged since the previous one.
 on:
   push:
     branches: [master]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write # GitHub release
   id-token: write # npm trusted publishing (OIDC), no npm token needed
 
 jobs:
@@ -40,3 +41,11 @@ jobs:
 
       - if: steps.check.outputs.publish == 'true'
         run: npm publish
+
+      - name: Create the GitHub release
+        if: steps.check.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          gh release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes
