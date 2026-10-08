@@ -26,7 +26,7 @@ For the rest of the functionnalities of the thermostat in the Home app, everythi
 
 ## Installation
 
-Install or update this plugin using `npm i -g homebridge-heatzy-as-thermostat`.
+Install or update this plugin using `npm i -g @cteq3132/homebridge-heatzy-pilote-as-thermostat`.
 
 Update the `config.json` file of your Homebridge setup, by modifying the sample configuration below.
 
@@ -82,3 +82,8 @@ The second command will return many datas. For each Heatzy device, you must find
 `curl -X POST --header 'Content-Type: application/json' --header 'Accept: application/json' --header 'X-Gizwits-Application-Id: c70a66ff039d41b4a220e198b0fcc8b3' -d '{ "username": "USERNAME", "password": "PASSWORD", "lang": "en" }' 'https://euapi.gizwits.com/app/login'`
 
 `curl -X GET --header 'Accept: application/json' --header 'X-Gizwits-User-token: YOURTOKEN' --header 'X-Gizwits-Application-Id: c70a66ff039d41b4a220e198b0fcc8b3' 'https://euapi.gizwits.com/app/bindings?limit=20&skip=0'`
+
+
+## Publishing a new version
+
+Bump `version` in `package.json` and merge into `master`: the [Publish to npm](.github/workflows/publish.yml) GitHub Action publishes the package if this version is not on npm yet. It uses npm trusted publishing, configured on npmjs.com in the package settings (Trusted Publisher → GitHub Actions, repository `Cteq3132/homebridge-heatzy-pilote-as-thermostat`, workflow `publish.yml`).
